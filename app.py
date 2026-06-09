@@ -1,4 +1,4 @@
-"""Streamlit UI for the Lighthouse Market Monitor revenue intelligence app."""
+"""Streamlit UI for the Market Insights Analytics revenue intelligence app."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from comparator import DEMAND_NUM, DEMAND_ORDER, LEVEL_NUM, compare_snapshots
 from parser import parse_lighthouse_export
 
 
-APP_TITLE = "Lighthouse Market Monitor"
+APP_TITLE = "Market Insights Analytics"
 DEMAND_COLORS = {
     "Low": "#94a3b8",
     "Normal": "#60a5fa",
@@ -158,7 +158,7 @@ def render_header() -> None:
         f"""
 <div class="app-header">
   <h1>{APP_TITLE}</h1>
-  <p>Daily revenue intelligence for Lighthouse Market Insights snapshots.</p>
+  <p>Daily revenue intelligence for market insights snapshots.</p>
 </div>
 """,
         unsafe_allow_html=True,
@@ -177,9 +177,9 @@ def render_uploaders() -> tuple[Any | None, Any | None]:
     st.markdown('<div class="section-label">Load Snapshots</div>', unsafe_allow_html=True)
     left, right = st.columns(2)
     with left:
-        yesterday = st.file_uploader("Yesterday's Lighthouse export", type=["xlsx"], key="yesterday_upload")
+        yesterday = st.file_uploader("Yesterday's market insights export", type=["xlsx"], key="yesterday_upload")
     with right:
-        today = st.file_uploader("Today's Lighthouse export", type=["xlsx"], key="today_upload")
+        today = st.file_uploader("Today's market insights export", type=["xlsx"], key="today_upload")
     return yesterday, today
 
 
@@ -210,7 +210,7 @@ def parse_uploads(today_file: Any, yesterday_file: Any | None) -> tuple[dict[str
     Returns:
         Parsed today data and optional parsed yesterday data.
     """
-    with st.spinner("Parsing Lighthouse exports..."):
+    with st.spinner("Parsing market insights exports..."):
         try:
             today_data = parse_cached(today_file.getvalue(), today_file.name)
             yesterday_data = (
@@ -247,7 +247,7 @@ def render_empty_state() -> None:
     Returns:
         None.
     """
-    st.info("Upload today's Lighthouse Market Insights `.xlsx` export to begin. Add yesterday's export to unlock alerts and overnight changes.")
+    st.info("Upload today's market insights `.xlsx` export to begin. Add yesterday's export to unlock alerts and overnight changes.")
 
 
 def render_ai_sidebar(df_context: pd.DataFrame | None) -> None:
@@ -297,7 +297,7 @@ def render_ai_sidebar(df_context: pd.DataFrame | None) -> None:
                     {
                         "role": "system",
                         "content": (
-                            "You are a hotel revenue management analyst. The user has loaded a Lighthouse market "
+                            "You are a hotel revenue management analyst. The user has loaded a market "
                             "insights snapshot. Answer questions about the data concisely and in plain language. "
                             "Always ground answers in the actual numbers from the snapshot."
                         ),
@@ -684,7 +684,7 @@ def render_full_data(df_today: pd.DataFrame, df_future: pd.DataFrame) -> None:
     st.download_button(
         "Download CSV",
         data=data.to_csv(index=False),
-        file_name="lighthouse_daily_details.csv",
+        file_name="market_insights_daily_details.csv",
         mime="text/csv",
         use_container_width=True,
     )
