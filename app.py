@@ -286,7 +286,7 @@ def render_ai_sidebar(df_context: pd.DataFrame | None) -> None:
 
         context = df_context.head(30).copy()
         context["Date"] = context["Date"].dt.strftime("%Y-%m-%d")
-        context_md = context.to_markdown(index=False)
+        context_csv = context.to_csv(index=False)
         client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
         st.session_state["ai_calls"] += 1
         with st.chat_message("assistant"):
@@ -302,7 +302,7 @@ def render_ai_sidebar(df_context: pd.DataFrame | None) -> None:
                             "Always ground answers in the actual numbers from the snapshot."
                         ),
                     },
-                    {"role": "user", "content": f"Forward-period data, truncated to 30 rows:\n\n{context_md}\n\nQuestion: {question}"},
+                    {"role": "user", "content": f"Forward-period data as CSV, truncated to 30 rows:\n\n{context_csv}\n\nQuestion: {question}"},
                 ],
             )
             st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
