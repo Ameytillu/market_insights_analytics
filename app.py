@@ -783,41 +783,39 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
         return
 
     combined = build_operational_table(df_future, dpu_df)
-    urgent = combined[(combined["Demand level"] == "Very high") & (combined["Rooms Variance"] < 0)]
+    urgent = combined[(combined["Demand level"] == "Very high") & (combined["Rooms Pickup"] < 0)]
     sold_cheap = combined[
         combined["My price"].astype(str).str.lower().eq("sold out")
         & combined["ADR on Books"].notna()
-        & combined["STLY ADR"].notna()
-        & (combined["ADR on Books"] < combined["STLY ADR"])
     ]
-    soft_ahead = combined[(combined["Rooms Variance"] > 10) & (combined["Demand level"].isin(["Low", "Normal"]))]
+    soft_ahead = combined[(combined["Rooms Pickup"] > 10) & (combined["Demand level"].isin(["Low", "Normal"]))]
 
     cols = st.columns(3)
     with cols[0]:
         st.markdown(
-            f'<div class="callout"><b>{len(urgent)}</b> high-demand date(s) are behind pace. '
+            f'<div class="callout"><b>{len(urgent)}</b> high-demand date(s) have negative room pickup. '
             f'{_date_list(urgent)}</div>',
             unsafe_allow_html=True,
         )
     with cols[1]:
         st.markdown(
-            f'<div class="callout"><b>{len(sold_cheap)}</b> sold-out date(s) show ADR below STLY. '
+            f'<div class="callout"><b>{len(sold_cheap)}</b> sold-out date(s) have ADR on books to review. '
             f'{_date_list(sold_cheap)}</div>',
             unsafe_allow_html=True,
         )
     with cols[2]:
         st.markdown(
-            f'<div class="callout"><b>{len(soft_ahead)}</b> soft-demand date(s) are ahead of pace. '
+            f'<div class="callout"><b>{len(soft_ahead)}</b> soft-demand date(s) have strong room pickup. '
             f'{_date_list(soft_ahead)}</div>',
             unsafe_allow_html=True,
         )
 
     display = combined.copy()
     display["Date"] = display["Date"].dt.strftime("%a %b %d")
-    for column in ["ADR on Books", "STLY ADR", "ADR Variance", "My price"]:
+    for column in ["ADR on Books", "My price"]:
         if column in display.columns:
             display[column] = display[column].map(money)
-    for column in ["Rooms on Books", "STLY Rooms", "Rooms Variance"]:
+    for column in ["Rooms on Books", "Rooms Pickup"]:
         if column in display.columns:
             display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{float(value):,.0f}")
     st.dataframe(display, use_container_width=True, hide_index=True, height=460)
@@ -1096,6 +1094,8 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd
         right = right.rename(columns={"index": "Date"})
     right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
     combined = left.merge(right, on="Date", how="left")
+    if "Rooms Pickup" not in combined.columns:
+        combined["Rooms Pickup"] = np.nan
     if "Rooms Variance" not in combined.columns:
         combined["Rooms Variance"] = combined["Rooms on Books"] - combined["STLY Rooms"]
     if "ADR Variance" not in combined.columns:
@@ -1115,11 +1115,7 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd
             "My price level",
             "Rooms on Books",
             "ADR on Books",
-            "STLY Rooms",
-            "STLY ADR",
-            "Rooms Variance",
-            "ADR Variance",
-            "Pace Status",
+            "Rooms Pickup",
         ]
     ]
 

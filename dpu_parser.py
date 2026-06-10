@@ -13,6 +13,7 @@ CANONICAL_COLUMNS = [
     "Arrival Date",
     "Rooms on Books",
     "ADR on Books",
+    "Rooms Pickup",
     "STLY Rooms",
     "STLY ADR",
 ]
@@ -42,14 +43,12 @@ def parse_dpu_report(file: Any) -> pd.DataFrame:
     combined = combined.dropna(subset=["Arrival Date"]).copy()
     combined["Arrival Date"] = pd.to_datetime(combined["Arrival Date"]).dt.normalize()
     combined = combined.sort_values(["Arrival Date", "_sheet_order"])
-    combined = combined.groupby("Arrival Date", as_index=False).agg(
-        {
-            "Rooms on Books": _last_valid,
-            "ADR on Books": _last_valid,
-            "STLY Rooms": _last_valid,
-            "STLY ADR": _last_valid,
-        }
-    )
+    aggregated: list[pd.Series] = []
+    for arrival_date, group in combined.groupby("Arrival Date", sort=True):
+        row = _aggregate_arrival_date(group)
+        row["Arrival Date"] = arrival_date
+        aggregated.append(row)
+    combined = pd.DataFrame(aggregated)
     combined["Rooms Variance"] = combined["Rooms on Books"] - combined["STLY Rooms"]
     combined["ADR Variance"] = combined["ADR on Books"] - combined["STLY ADR"]
     return combined.set_index("Arrival Date").sort_index()
@@ -83,7 +82,7 @@ def _parse_sheet(workbook: pd.ExcelFile, sheet_name: str, sheet_order: int) -> p
             out[column] = np.nan
 
     out["Arrival Date"] = out["Arrival Date"].map(_parse_date)
-    for column in ["Rooms on Books", "ADR on Books", "STLY Rooms", "STLY ADR"]:
+    for column in ["Rooms on Books", "ADR on Books", "Rooms Pickup", "STLY Rooms", "STLY ADR"]:
         out[column] = pd.to_numeric(out[column].map(_null_if_blank), errors="coerce")
     out["_sheet_order"] = sheet_order
     return out[CANONICAL_COLUMNS + ["_sheet_order"]]
@@ -101,6 +100,12 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
     block_headers = headers[date_col:next_date_col]
     rooms_col = _relative_column(block_headers, "rooms", date_col)
     adr_col = _relative_column(block_headers, "adr", date_col)
+    pickup_rooms_col = None
+    if len(date_columns) > 1:
+        pickup_date_col = date_columns[1]
+        pickup_next_date_col = next((column for column in date_columns[2:] if column > pickup_date_col), len(headers))
+        pickup_headers = headers[pickup_date_col:pickup_next_date_col]
+        pickup_rooms_col = _relative_column(pickup_headers, "rooms", pickup_date_col)
     if rooms_col is None and adr_col is None:
         return None
 
@@ -118,6 +123,7 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
                 "Arrival Date": arrival_date,
                 "Rooms on Books": raw.iat[row_index, rooms_col] if rooms_col is not None else np.nan,
                 "ADR on Books": raw.iat[row_index, adr_col] if adr_col is not None else np.nan,
+                "Rooms Pickup": raw.iat[row_index, pickup_rooms_col] if pickup_rooms_col is not None else np.nan,
                 "STLY Rooms": np.nan,
                 "STLY ADR": np.nan,
                 "_sheet_order": sheet_order,
@@ -127,7 +133,7 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
     if not rows:
         return None
     out = pd.DataFrame(rows)
-    for column in ["Rooms on Books", "ADR on Books", "STLY Rooms", "STLY ADR"]:
+    for column in ["Rooms on Books", "ADR on Books", "Rooms Pickup", "STLY Rooms", "STLY ADR"]:
         out[column] = pd.to_numeric(out[column].map(_null_if_blank), errors="coerce")
     return out[CANONICAL_COLUMNS + ["_sheet_order"]]
 
@@ -231,3 +237,22 @@ def _last_valid(series: pd.Series) -> Any:
     """Return the latest non-null value from a sheet-ordered series."""
     valid = series.dropna()
     return np.nan if valid.empty else valid.iloc[-1]
+
+
+def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
+    """Aggregate sheet snapshots into one operational row for an arrival date."""
+    rooms_history = group["Rooms on Books"].dropna()
+    if len(rooms_history) >= 2:
+        rooms_pickup = rooms_history.iloc[-1] - rooms_history.iloc[0]
+    else:
+        rooms_pickup = _last_valid(group["Rooms Pickup"])
+
+    return pd.Series(
+        {
+            "Rooms on Books": _last_valid(group["Rooms on Books"]),
+            "ADR on Books": _last_valid(group["ADR on Books"]),
+            "Rooms Pickup": rooms_pickup,
+            "STLY Rooms": _last_valid(group["STLY Rooms"]),
+            "STLY ADR": _last_valid(group["STLY ADR"]),
+        }
+    )
