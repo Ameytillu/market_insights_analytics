@@ -312,7 +312,7 @@ def parse_dpu_upload(dpu_file: Any | None) -> pd.DataFrame | None:
         return None
     with st.spinner("Parsing DPU report..."):
         try:
-            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "sheet_dpu_pickup_forecast_v3")
+            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "sheet_dpu_segment_pickup_v4")
         except Exception as exc:
             st.warning(f"DPU report could not be parsed: {exc}")
             return None
@@ -835,7 +835,18 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
     for column in ["ADR on Books", "My price"]:
         if column in display.columns:
             display[column] = display[column].map(money)
-    for column in ["Rooms on Books", "Pickup Start Rooms", "Rooms Pickup", "Pickup Per Day", "Forecast Pickup", "Forecast Rooms OTB"]:
+    for column in [
+        "Rooms on Books",
+        "Transient Rooms",
+        "Group Rooms",
+        "Rooms Pickup",
+        "Transient Pickup",
+        "Group Pickup",
+        "Cumulative Rooms Pickup",
+        "Pickup Per Day",
+        "Forecast Pickup",
+        "Forecast Rooms OTB",
+    ]:
         if column in display.columns:
             display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{float(value):,.0f}")
     st.dataframe(display, use_container_width=True, hide_index=True, height=460)
@@ -848,10 +859,15 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
         options = detail["Date"].dt.strftime("%Y-%m-%d").tolist()
         selected = st.selectbox("Arrival date pickup detail", options=options)
         row = detail[detail["Date"].dt.strftime("%Y-%m-%d") == selected].iloc[0]
+        explanation = pickup_explanation(row)
         st.markdown(
-            f'<div class="callout">For <b>{row["Date"].strftime("%a %b %d")}</b>, rooms moved from '
-            f'<b>{_whole_number(row.get("Pickup Start Rooms"))}</b> to <b>{_whole_number(row.get("Rooms on Books"))}</b>, '
-            f'a net pickup of <b>{_signed_number(row.get("Rooms Pickup"))}</b> rooms across '
+            f'<div class="callout">For <b>{row["Date"].strftime("%a %b %d")}</b>, DPU pickup is '
+            f'<b>{_signed_number(row.get("Rooms Pickup"))}</b> rooms: transient '
+            f'<b>{_signed_number(row.get("Transient Pickup"))}</b>, group '
+            f'<b>{_signed_number(row.get("Group Pickup"))}</b>. <b>{html.escape(explanation)}</b> '
+            f'Cumulative rooms moved from <b>{_whole_number(row.get("Pickup Start Rooms"))}</b> to '
+            f'<b>{_whole_number(row.get("Rooms on Books"))}</b>, a total change of '
+            f'<b>{_signed_number(row.get("Cumulative Rooms Pickup"))}</b> across '
             f'<b>{_whole_number(row.get("Pickup Snapshot Count"))}</b> DPU snapshots. Current velocity is '
             f'<b>{_signed_number(row.get("Pickup Per Day"))}</b> rooms/day. Forecast additional pickup is '
             f'<b>{_signed_number(row.get("Forecast Pickup"))}</b>, putting projected rooms OTB near '
@@ -1167,12 +1183,16 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, confi
         combined["Pickup Per Day"] = np.nan
     if "Pickup Snapshot Count" not in combined.columns:
         combined["Pickup Snapshot Count"] = np.nan
+    for column in ["Transient Rooms", "Group Rooms", "Transient Pickup", "Group Pickup", "Cumulative Rooms Pickup"]:
+        if column not in combined.columns:
+            combined[column] = np.nan
     if "Rooms Variance" not in combined.columns:
         combined["Rooms Variance"] = combined["Rooms on Books"] - combined["STLY Rooms"]
     if "ADR Variance" not in combined.columns:
         combined["ADR Variance"] = combined["ADR on Books"] - combined["STLY ADR"]
     combined["Forecast Pickup"] = combined.apply(lambda row: forecast_room_pickup(row, config or {}), axis=1)
     combined["Forecast Rooms OTB"] = combined["Rooms on Books"] + combined["Forecast Pickup"]
+    combined["Pickup Explanation"] = combined.apply(pickup_explanation, axis=1)
     combined["Pace Status"] = np.select(
         [combined["Rooms Variance"].isna(), combined["Rooms Variance"] > 5, combined["Rooms Variance"] < -5],
         ["N/A", "Ahead", "Behind"],
@@ -1188,11 +1208,18 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, confi
             "My price level",
             "Rooms on Books",
             "ADR on Books",
+            "Transient Rooms",
+            "Group Rooms",
             "Pickup Start Rooms",
             "Rooms Pickup",
+            "Transient Pickup",
+            "Group Pickup",
+            "Cumulative Rooms Pickup",
             "Pickup Per Day",
+            "Pickup Snapshot Count",
             "Forecast Pickup",
             "Forecast Rooms OTB",
+            "Pickup Explanation",
             "DPU Match",
         ]
     ]
@@ -1231,6 +1258,37 @@ def forecast_room_pickup(row: pd.Series, config: dict[str, Any]) -> float:
     total_rooms = float(config.get("total_rooms", 433))
     remaining_supply = max(total_rooms - rooms_on_books, 0)
     return float(max(-rooms_on_books, min(remaining_supply, forecast)))
+
+
+def pickup_explanation(row: pd.Series) -> str:
+    """Explain the likely driver of room pickup for an operational row.
+
+    Args:
+        row: Combined Lighthouse/DPU operational row.
+
+    Returns:
+        Plain-English explanation for positive, flat, or negative pickup.
+    """
+    total = pd.to_numeric(row.get("Rooms Pickup"), errors="coerce")
+    transient = pd.to_numeric(row.get("Transient Pickup"), errors="coerce")
+    group = pd.to_numeric(row.get("Group Pickup"), errors="coerce")
+    if pd.isna(total):
+        return "Pickup detail is unavailable for this date."
+    if total < 0:
+        if pd.notna(group) and group < 0 and (pd.isna(transient) or abs(group) >= abs(transient)):
+            return f"Pickup is negative mainly because group rooms were released ({_signed_number(group)} group rooms)."
+        if pd.notna(transient) and transient < 0:
+            return f"Pickup is negative mainly because transient rooms washed or cancelled ({_signed_number(transient)} transient rooms)."
+        return "Pickup is negative, so inventory moved backward versus the prior DPU snapshot."
+    if total > 0:
+        if pd.notna(group) and group > 0 and pd.notna(transient) and transient > 0:
+            return "Pickup is positive from both transient and group segments."
+        if pd.notna(group) and group > 0 and (pd.isna(transient) or group >= transient):
+            return f"Pickup is positive mainly from group rooms ({_signed_number(group)} group rooms)."
+        if pd.notna(transient) and transient > 0:
+            return f"Pickup is positive mainly from transient rooms ({_signed_number(transient)} transient rooms)."
+        return "Pickup is positive versus the prior DPU snapshot."
+    return "Pickup is flat versus the prior DPU snapshot."
 
 
 def _lookup_dpu(dpu_df: pd.DataFrame | None, date_value: Any) -> pd.Series | None:

@@ -13,7 +13,12 @@ CANONICAL_COLUMNS = [
     "Arrival Date",
     "Rooms on Books",
     "ADR on Books",
+    "Transient Rooms",
+    "Group Rooms",
     "Rooms Pickup",
+    "Transient Pickup",
+    "Group Pickup",
+    "Cumulative Rooms Pickup",
     "Pickup Start Rooms",
     "Pickup Per Day",
     "Pickup Snapshot Count",
@@ -85,15 +90,31 @@ def _parse_sheet(workbook: pd.ExcelFile, sheet_name: str, sheet_order: int) -> p
             out[column] = np.nan
 
     out["Arrival Date"] = out["Arrival Date"].map(_parse_date)
-    for column in ["Rooms on Books", "ADR on Books", "Rooms Pickup", "STLY Rooms", "STLY ADR"]:
+    for column in [
+        "Rooms on Books",
+        "ADR on Books",
+        "Transient Rooms",
+        "Group Rooms",
+        "Rooms Pickup",
+        "Transient Pickup",
+        "Group Pickup",
+        "Cumulative Rooms Pickup",
+        "Pickup Start Rooms",
+        "Pickup Per Day",
+        "Pickup Snapshot Count",
+        "STLY Rooms",
+        "STLY ADR",
+    ]:
         out[column] = pd.to_numeric(out[column].map(_null_if_blank), errors="coerce")
     out["_sheet_order"] = sheet_order
-    return out[CANONICAL_COLUMNS + ["_sheet_order"]]
+    out["_sheet_day"] = _sheet_day_number(sheet_name)
+    return out[CANONICAL_COLUMNS + ["_sheet_order", "_sheet_day"]]
 
 
 def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: int) -> pd.DataFrame | None:
     """Parse the common DPU monthly table with Date, Day, Rooms, Occ, Revenue, ADR."""
     headers = [_normalize(value) for value in raw.iloc[header_row].tolist()]
+    parent_headers = _filled_parent_headers(raw.iloc[header_row - 1].tolist()) if header_row > 0 else [""] * len(headers)
     date_columns = [index for index, value in enumerate(headers) if _matches_arrival_date(value)]
     if not date_columns:
         return None
@@ -103,12 +124,20 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
     block_headers = headers[date_col:next_date_col]
     rooms_col = _relative_column(block_headers, "rooms", date_col)
     adr_col = _relative_column(block_headers, "adr", date_col)
+    transient_rooms_col = _parent_metric_column(headers, parent_headers, date_col, next_date_col, "transient", "rooms")
+    group_rooms_col = _parent_metric_column(headers, parent_headers, date_col, next_date_col, "group", "rooms")
     pickup_rooms_col = None
+    pickup_transient_col = None
+    pickup_group_col = None
     if len(date_columns) > 1:
         pickup_date_col = date_columns[1]
         pickup_next_date_col = next((column for column in date_columns[2:] if column > pickup_date_col), len(headers))
         pickup_headers = headers[pickup_date_col:pickup_next_date_col]
         pickup_rooms_col = _relative_column(pickup_headers, "rooms", pickup_date_col)
+        pickup_transient_col = _parent_metric_column(
+            headers, parent_headers, pickup_date_col, pickup_next_date_col, "transient", "rooms"
+        )
+        pickup_group_col = _parent_metric_column(headers, parent_headers, pickup_date_col, pickup_next_date_col, "group", "rooms")
     if rooms_col is None and adr_col is None:
         return None
 
@@ -124,15 +153,21 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
         rows.append(
             {
                 "Arrival Date": arrival_date,
-            "Rooms on Books": raw.iat[row_index, rooms_col] if rooms_col is not None else np.nan,
-            "ADR on Books": raw.iat[row_index, adr_col] if adr_col is not None else np.nan,
-            "Rooms Pickup": raw.iat[row_index, pickup_rooms_col] if pickup_rooms_col is not None else np.nan,
-            "Pickup Start Rooms": np.nan,
-            "Pickup Per Day": np.nan,
-            "Pickup Snapshot Count": np.nan,
-            "STLY Rooms": np.nan,
-            "STLY ADR": np.nan,
-            "_sheet_order": sheet_order,
+                "Rooms on Books": raw.iat[row_index, rooms_col] if rooms_col is not None else np.nan,
+                "ADR on Books": raw.iat[row_index, adr_col] if adr_col is not None else np.nan,
+                "Transient Rooms": raw.iat[row_index, transient_rooms_col] if transient_rooms_col is not None else np.nan,
+                "Group Rooms": raw.iat[row_index, group_rooms_col] if group_rooms_col is not None else np.nan,
+                "Rooms Pickup": raw.iat[row_index, pickup_rooms_col] if pickup_rooms_col is not None else np.nan,
+                "Transient Pickup": raw.iat[row_index, pickup_transient_col] if pickup_transient_col is not None else np.nan,
+                "Group Pickup": raw.iat[row_index, pickup_group_col] if pickup_group_col is not None else np.nan,
+                "Cumulative Rooms Pickup": np.nan,
+                "Pickup Start Rooms": np.nan,
+                "Pickup Per Day": np.nan,
+                "Pickup Snapshot Count": np.nan,
+                "STLY Rooms": np.nan,
+                "STLY ADR": np.nan,
+                "_sheet_order": sheet_order,
+                "_sheet_day": sheet_order + 1,
             }
         )
 
@@ -142,7 +177,12 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
     for column in [
         "Rooms on Books",
         "ADR on Books",
+        "Transient Rooms",
+        "Group Rooms",
         "Rooms Pickup",
+        "Transient Pickup",
+        "Group Pickup",
+        "Cumulative Rooms Pickup",
         "Pickup Start Rooms",
         "Pickup Per Day",
         "Pickup Snapshot Count",
@@ -150,7 +190,7 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
         "STLY ADR",
     ]:
         out[column] = pd.to_numeric(out[column].map(_null_if_blank), errors="coerce")
-    return out[CANONICAL_COLUMNS + ["_sheet_order"]]
+    return out[CANONICAL_COLUMNS + ["_sheet_order", "_sheet_day"]]
 
 
 def _relative_column(headers: list[str], target: str, offset: int) -> int | None:
@@ -159,6 +199,45 @@ def _relative_column(headers: list[str], target: str, offset: int) -> int | None
         if value == target or target in value.split():
             return offset + relative_index
     return None
+
+
+def _filled_parent_headers(values: list[Any]) -> list[str]:
+    """Forward-fill section headers from the row above the metric header."""
+    filled: list[str] = []
+    current = ""
+    for value in values:
+        text = _normalize(value)
+        if text:
+            current = text
+        filled.append(current)
+    return filled
+
+
+def _parent_metric_column(
+    headers: list[str],
+    parent_headers: list[str],
+    start: int,
+    stop: int,
+    parent_token: str,
+    metric_token: str,
+) -> int | None:
+    """Find a metric column under a parent section, such as Group Rooms."""
+    for index in range(start, min(stop, len(headers))):
+        if parent_token not in parent_headers[index]:
+            continue
+        if metric_token in headers[index]:
+            return index
+        if metric_token == "rooms" and not headers[index]:
+            return index
+    return None
+
+
+def _sheet_day_number(sheet_name: str) -> int | float:
+    """Return the day number represented by a numeric DPU sheet name."""
+    try:
+        return int(str(sheet_name).strip())
+    except ValueError:
+        return np.nan
 
 
 def _detect_columns(columns: pd.Index) -> dict[Any, str]:
@@ -232,6 +311,8 @@ def _parse_date(value: Any) -> pd.Timestamp:
 
 
 def _normalize(value: Any) -> str:
+    if pd.isna(value):
+        return ""
     return " ".join(str(value).strip().lower().replace("_", " ").replace("-", " ").split())
 
 
@@ -259,19 +340,28 @@ def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
     rooms_history = group["Rooms on Books"].dropna()
     if len(rooms_history) >= 2:
         pickup_start_rooms = rooms_history.iloc[0]
-        rooms_pickup = rooms_history.iloc[-1] - pickup_start_rooms
+        cumulative_rooms_pickup = rooms_history.iloc[-1] - pickup_start_rooms
     else:
         pickup_start_rooms = np.nan
-        rooms_pickup = _last_valid(group["Rooms Pickup"])
+        cumulative_rooms_pickup = np.nan
     snapshot_count = int(group["_sheet_order"].nunique())
     sheet_span = max(float(group["_sheet_order"].max() - group["_sheet_order"].min()), 1.0)
-    pickup_per_day = rooms_pickup / sheet_span if pd.notna(rooms_pickup) else np.nan
+    pickup_per_day = cumulative_rooms_pickup / sheet_span if pd.notna(cumulative_rooms_pickup) else np.nan
+    pickup_row = _pickup_row_for_current_day(group)
+    rooms_pickup = _number_or_nan(pickup_row.get("Rooms Pickup"))
+    if pd.isna(rooms_pickup):
+        rooms_pickup = cumulative_rooms_pickup
 
     return pd.Series(
         {
             "Rooms on Books": _last_valid(group["Rooms on Books"]),
             "ADR on Books": _last_valid(group["ADR on Books"]),
+            "Transient Rooms": _last_valid(group["Transient Rooms"]),
+            "Group Rooms": _last_valid(group["Group Rooms"]),
             "Rooms Pickup": rooms_pickup,
+            "Transient Pickup": _number_or_nan(pickup_row.get("Transient Pickup")),
+            "Group Pickup": _number_or_nan(pickup_row.get("Group Pickup")),
+            "Cumulative Rooms Pickup": cumulative_rooms_pickup,
             "Pickup Start Rooms": pickup_start_rooms,
             "Pickup Per Day": pickup_per_day,
             "Pickup Snapshot Count": snapshot_count,
@@ -279,3 +369,21 @@ def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
             "STLY ADR": _last_valid(group["STLY ADR"]),
         }
     )
+
+
+def _pickup_row_for_current_day(group: pd.DataFrame) -> pd.Series:
+    """Return the row whose sheet day best represents today's DPU pickup snapshot."""
+    today_day = pd.Timestamp.today().day
+    by_day = group[group["_sheet_day"] == today_day]
+    if not by_day.empty:
+        return by_day.iloc[-1]
+    valid_pickup = group[group["Rooms Pickup"].notna()]
+    if not valid_pickup.empty:
+        return valid_pickup.iloc[-1]
+    return group.iloc[-1]
+
+
+def _number_or_nan(value: Any) -> float:
+    """Convert a value to float or NaN."""
+    number = pd.to_numeric(value, errors="coerce")
+    return float(number) if pd.notna(number) else np.nan
