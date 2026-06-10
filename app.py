@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,7 @@ from snapshot_store import build_trend_dataframe, save_snapshot, snapshot_summar
 
 
 APP_TITLE = "Market Insights Analytics"
+APP_TIMEZONE = "America/Chicago"
 DEMAND_COLORS = {
     "Low": "#94a3b8",
     "Normal": "#60a5fa",
@@ -71,7 +73,7 @@ def main() -> None:
 
     df_today = df_today.copy()
     df_today["Date"] = pd.to_datetime(df_today["Date"]).dt.normalize()
-    current_day = pd.Timestamp(datetime.today().date())
+    current_day = current_business_day()
     df_future = df_today[df_today["Date"] >= current_day].copy()
     if df_future.empty:
         df_future = df_today.copy()
@@ -166,6 +168,18 @@ def render_header() -> None:
 """,
         unsafe_allow_html=True,
     )
+
+
+def current_business_day() -> pd.Timestamp:
+    """Return today's hotel-local business date.
+
+    Args:
+        None.
+
+    Returns:
+        Normalized date in the app's configured hotel timezone.
+    """
+    return pd.Timestamp(datetime.now(ZoneInfo(APP_TIMEZONE)).date())
 
 
 def render_uploaders() -> tuple[Any | None, Any | None, Any | None]:
@@ -312,7 +326,7 @@ def parse_dpu_upload(dpu_file: Any | None) -> pd.DataFrame | None:
         return None
     with st.spinner("Parsing DPU report..."):
         try:
-            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "sheet_dpu_segment_pickup_v4")
+            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "central_time_pickup_v5")
         except Exception as exc:
             st.warning(f"DPU report could not be parsed: {exc}")
             return None
@@ -1242,7 +1256,7 @@ def forecast_room_pickup(row: pd.Series, config: dict[str, Any]) -> float:
 
     forecast_date = row.get("DPU Date") if pd.notna(row.get("DPU Date")) else row.get("Date")
     arrival_date = pd.Timestamp(forecast_date).normalize()
-    days_to_arrival = max((arrival_date - pd.Timestamp(datetime.today().date())).days, 0)
+    days_to_arrival = max((arrival_date - current_business_day()).days, 0)
     if days_to_arrival == 0:
         return 0.0
 

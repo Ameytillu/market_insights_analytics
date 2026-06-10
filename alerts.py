@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from comparator import LEVEL_NUM, compare_snapshots
 
 
 SEVERITY_RANK = {"critical": 0, "warning": 1, "opportunity": 2, "info": 3}
+APP_TIMEZONE = "America/Chicago"
 UNDERPRICED_LEVELS = {"Very low", "Low", "Normal"}
 HIGH_DEMAND_LEVELS = {"High", "Very high"}
 ELEVATED_DEMAND_LEVELS = {"Elevated", "High", "Very high"}
@@ -43,7 +45,7 @@ def generate_alerts(
     """
     active_suppressions = {**DEFAULT_SUPPRESSIONS, **(suppressions or {})}
     comparison = compare_snapshots(df_today, df_yesterday)
-    today = pd.Timestamp(datetime.today().date())
+    today = pd.Timestamp(datetime.now(ZoneInfo(APP_TIMEZONE)).date())
     future = comparison[comparison["Date"] >= today].copy()
     alerts: list[dict[str, Any]] = []
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 
+APP_TIMEZONE = "America/Chicago"
 CANONICAL_COLUMNS = [
     "Arrival Date",
     "Rooms on Books",
@@ -373,7 +375,7 @@ def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
 
 def _pickup_row_for_current_day(group: pd.DataFrame) -> pd.Series:
     """Return the row whose sheet day best represents today's DPU pickup snapshot."""
-    today_day = pd.Timestamp.today().day
+    today_day = datetime.now(ZoneInfo(APP_TIMEZONE)).day
     by_day = group[group["_sheet_day"] == today_day]
     if not by_day.empty:
         return by_day.iloc[-1]
