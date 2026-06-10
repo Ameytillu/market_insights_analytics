@@ -376,10 +376,14 @@ def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
 def _pickup_row_for_current_day(group: pd.DataFrame) -> pd.Series:
     """Return the row whose sheet day best represents today's DPU pickup snapshot."""
     today_day = datetime.now(ZoneInfo(APP_TIMEZONE)).day
-    by_day = group[group["_sheet_day"] == today_day]
+    usable = group[group["Rooms on Books"].notna()].copy()
+    by_day = usable[usable["_sheet_day"] == today_day]
     if not by_day.empty:
         return by_day.iloc[-1]
-    valid_pickup = group[group["Rooms Pickup"].notna()]
+    prior_days = usable[usable["_sheet_day"] <= today_day]
+    if not prior_days.empty:
+        return prior_days.iloc[-1]
+    valid_pickup = usable[usable["Rooms Pickup"].notna()]
     if not valid_pickup.empty:
         return valid_pickup.iloc[-1]
     return group.iloc[-1]

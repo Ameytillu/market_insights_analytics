@@ -326,7 +326,7 @@ def parse_dpu_upload(dpu_file: Any | None) -> pd.DataFrame | None:
         return None
     with st.spinner("Parsing DPU report..."):
         try:
-            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "central_time_pickup_v5")
+            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "valid_sheet_segment_pickup_v6")
         except Exception as exc:
             st.warning(f"DPU report could not be parsed: {exc}")
             return None
@@ -844,6 +844,17 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
             unsafe_allow_html=True,
         )
 
+    negative_pickup = combined[combined["Rooms Pickup"] < 0].copy()
+    if not negative_pickup.empty:
+        st.markdown('<div class="section-label">Negative Pickup Dates</div>', unsafe_allow_html=True)
+        negative_display = negative_pickup[
+            ["Date", "Demand level", "Rooms Pickup", "Transient Pickup", "Group Pickup", "Pickup Explanation"]
+        ].copy()
+        negative_display["Date"] = negative_display["Date"].dt.strftime("%a %b %d")
+        for column in ["Rooms Pickup", "Transient Pickup", "Group Pickup"]:
+            negative_display[column] = negative_display[column].map(lambda value: "" if pd.isna(value) else f"{float(value):+,.0f}")
+        st.dataframe(negative_display, use_container_width=True, hide_index=True, height=180)
+
     display = combined.copy()
     display["Date"] = display["Date"].dt.strftime("%a %b %d")
     for column in ["ADR on Books", "My price"]:
@@ -870,9 +881,10 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
     if detail.empty:
         st.info("No DPU rows matched the Lighthouse dates. Check whether the DPU month matches the Lighthouse arrival month.")
     else:
-        options = detail["Date"].dt.strftime("%Y-%m-%d").tolist()
+        detail["Pickup Option"] = detail.apply(_pickup_option_label, axis=1)
+        options = detail["Pickup Option"].tolist()
         selected = st.selectbox("Arrival date pickup detail", options=options)
-        row = detail[detail["Date"].dt.strftime("%Y-%m-%d") == selected].iloc[0]
+        row = detail[detail["Pickup Option"] == selected].iloc[0]
         explanation = pickup_explanation(row)
         st.markdown(
             f'<div class="callout">For <b>{row["Date"].strftime("%a %b %d")}</b>, DPU pickup is '
@@ -1303,6 +1315,36 @@ def pickup_explanation(row: pd.Series) -> str:
             return f"Pickup is positive mainly from transient rooms ({_signed_number(transient)} transient rooms)."
         return "Pickup is positive versus the prior DPU snapshot."
     return "Pickup is flat versus the prior DPU snapshot."
+
+
+def _pickup_option_label(row: pd.Series) -> str:
+    """Build a selectbox label that exposes pickup amount and driver.
+
+    Args:
+        row: Combined Lighthouse/DPU operational row.
+
+    Returns:
+        Concise label for choosing an arrival date.
+    """
+    date_label = pd.Timestamp(row["Date"]).strftime("%a %b %d")
+    total = pd.to_numeric(row.get("Rooms Pickup"), errors="coerce")
+    transient = pd.to_numeric(row.get("Transient Pickup"), errors="coerce")
+    group = pd.to_numeric(row.get("Group Pickup"), errors="coerce")
+    if pd.isna(total):
+        return f"{date_label} | Pickup N/A"
+
+    if pd.notna(group) and pd.notna(transient):
+        if total < 0 and group < 0 and abs(group) >= abs(transient):
+            driver = f"Group {_signed_number(group)}"
+        elif total < 0 and transient < 0:
+            driver = f"Transient {_signed_number(transient)}"
+        elif group > transient:
+            driver = f"Group {_signed_number(group)}"
+        else:
+            driver = f"Transient {_signed_number(transient)}"
+    else:
+        driver = "Segment N/A"
+    return f"{date_label} | Pickup {_signed_number(total)} | {driver}"
 
 
 def _lookup_dpu(dpu_df: pd.DataFrame | None, date_value: Any) -> pd.Series | None:
