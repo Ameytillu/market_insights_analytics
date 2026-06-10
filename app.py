@@ -281,12 +281,13 @@ def parse_uploads(today_file: Any, yesterday_file: Any | None) -> tuple[dict[str
 
 
 @st.cache_data(show_spinner=False)
-def parse_dpu_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
+def parse_dpu_cached(file_bytes: bytes, filename: str, parser_version: str) -> pd.DataFrame:
     """Parse a DPU workbook with Streamlit caching.
 
     Args:
         file_bytes: Uploaded workbook bytes.
         filename: Uploaded filename used only as a cache key component.
+        parser_version: Manual cache-busting version for parser dependency changes.
 
     Returns:
         Parsed DPU DataFrame.
@@ -294,6 +295,7 @@ def parse_dpu_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
     from io import BytesIO
 
     _ = filename
+    _ = parser_version
     return parse_dpu_report(BytesIO(file_bytes))
 
 
@@ -310,7 +312,7 @@ def parse_dpu_upload(dpu_file: Any | None) -> pd.DataFrame | None:
         return None
     with st.spinner("Parsing DPU report..."):
         try:
-            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name)
+            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name, "sheet_dpu_pickup_forecast_v3")
         except Exception as exc:
             st.warning(f"DPU report could not be parsed: {exc}")
             return None
@@ -783,6 +785,10 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
         st.info("Upload a DPU report to unlock this view.")
         return
 
+    dpu_start = pd.Timestamp(dpu_df.index.min()).strftime("%b %d, %Y")
+    dpu_end = pd.Timestamp(dpu_df.index.max()).strftime("%b %d, %Y")
+    st.caption(f"DPU parsed {len(dpu_df):,} arrival dates from {dpu_start} to {dpu_end}.")
+
     combined = build_operational_table(df_future, dpu_df, config)
     urgent = combined[(combined["Demand level"] == "Very high") & (combined["Rooms Pickup"] < 0)]
     sold_cheap = combined[
@@ -1123,6 +1129,7 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, confi
     ].copy()
     left["Date"] = pd.to_datetime(left["Date"]).dt.normalize()
     left["MonthDay"] = left["Date"].dt.strftime("%m-%d")
+    left["DayOfMonth"] = left["Date"].dt.day
     right = dpu_df.reset_index().copy()
     if "Arrival Date" in right.columns:
         right = right.rename(columns={"Arrival Date": "Date"})
@@ -1131,8 +1138,9 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, confi
     right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
     right["DPU Date"] = right["Date"]
     right["MonthDay"] = right["Date"].dt.strftime("%m-%d")
-    dpu_columns = [column for column in right.columns if column not in {"Date", "MonthDay"}]
-    combined = left.merge(right[["Date", "MonthDay"] + dpu_columns], on=["Date", "MonthDay"], how="left")
+    right["DayOfMonth"] = right["Date"].dt.day
+    dpu_columns = [column for column in right.columns if column not in {"Date", "MonthDay", "DayOfMonth"}]
+    combined = left.merge(right[["Date", "MonthDay", "DayOfMonth"] + dpu_columns], on=["Date", "MonthDay", "DayOfMonth"], how="left")
     combined["DPU Match"] = np.where(combined["Rooms on Books"].notna(), "Exact date", "No match")
 
     missing = combined["Rooms on Books"].isna()
@@ -1142,6 +1150,14 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, confi
             combined.loc[missing, column] = combined.loc[missing, "MonthDay"].map(fallback[column])
         filled = missing & combined["Rooms on Books"].notna()
         combined.loc[filled, "DPU Match"] = "Month/day"
+
+    missing = combined["Rooms on Books"].isna()
+    if missing.any():
+        day_fallback = right.sort_values("Date").drop_duplicates("DayOfMonth", keep="last").set_index("DayOfMonth")
+        for column in dpu_columns:
+            combined.loc[missing, column] = combined.loc[missing, "DayOfMonth"].map(day_fallback[column])
+        filled = missing & combined["Rooms on Books"].notna()
+        combined.loc[filled, "DPU Match"] = "Day-of-month"
 
     if "Rooms Pickup" not in combined.columns:
         combined["Rooms Pickup"] = np.nan
