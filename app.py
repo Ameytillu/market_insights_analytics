@@ -13,9 +13,13 @@ import streamlit as st
 from openai import OpenAI
 from plotly.subplots import make_subplots
 
-from alerts import generate_alerts
+from alerts import DEFAULT_SUPPRESSIONS, generate_alerts
 from comparator import DEMAND_NUM, DEMAND_ORDER, LEVEL_NUM, compare_snapshots
+from decision_log import append_decision, decision_summary, decisions_dataframe, update_decision_outcome
+from dpu_parser import parse_dpu_report
 from parser import parse_lighthouse_export
+from rate_engine import recommend_rate
+from snapshot_store import build_trend_dataframe, save_snapshot, snapshot_summary
 
 
 APP_TITLE = "Market Insights Analytics"
@@ -50,13 +54,15 @@ def main() -> None:
     require_login()
     render_header()
 
-    uploaded_yesterday, uploaded_today = render_uploaders()
+    uploaded_yesterday, uploaded_today, uploaded_dpu = render_uploaders()
+    sidebar_config = render_config_sidebar()
     if uploaded_today is None:
         render_empty_state()
         render_ai_sidebar(None)
         return
 
     today_data, yesterday_data = parse_uploads(uploaded_today, uploaded_yesterday)
+    dpu_df = parse_dpu_upload(uploaded_dpu)
     df_today = today_data["daily"]
     df_yesterday = yesterday_data["daily"] if yesterday_data else None
     if df_today is None or df_today.empty:
@@ -71,12 +77,9 @@ def main() -> None:
         df_future = df_today.copy()
 
     render_snapshot_summary(df_today, df_yesterday is not None)
+    save_snapshot(df_today)
     render_ai_sidebar(df_future)
-
-    if df_yesterday is not None:
-        render_comparison_tabs(today_data, df_today, df_yesterday, df_future, current_day)
-    else:
-        render_single_file_tabs(today_data, df_today, df_future)
+    render_tabs(today_data, df_today, df_yesterday, df_future, current_day, dpu_df, sidebar_config)
 
 
 def inject_css() -> None:
@@ -165,14 +168,14 @@ def render_header() -> None:
     )
 
 
-def render_uploaders() -> tuple[Any | None, Any | None]:
+def render_uploaders() -> tuple[Any | None, Any | None, Any | None]:
     """Render the two snapshot uploaders.
 
     Args:
         None.
 
     Returns:
-        Tuple of yesterday upload and today upload.
+        Tuple of yesterday upload, today upload, and optional DPU upload.
     """
     st.markdown('<div class="section-label">Load Snapshots</div>', unsafe_allow_html=True)
     left, right = st.columns(2)
@@ -180,7 +183,62 @@ def render_uploaders() -> tuple[Any | None, Any | None]:
         yesterday = st.file_uploader("Yesterday's market insights export", type=["xlsx"], key="yesterday_upload")
     with right:
         today = st.file_uploader("Today's market insights export", type=["xlsx"], key="today_upload")
-    return yesterday, today
+    dpu = st.file_uploader("DPU Report (optional)", type=["xlsx"], key="dpu_upload")
+    return yesterday, today, dpu
+
+
+def render_config_sidebar() -> dict[str, Any]:
+    """Render persistent sidebar settings and summaries.
+
+    Args:
+        None.
+
+    Returns:
+        Dictionary of property settings and alert suppression toggles.
+    """
+    snap_summary = snapshot_summary()
+    dec_summary = decision_summary()
+    with st.sidebar:
+        st.header("Property Settings")
+        with st.expander("Property settings", expanded=False):
+            total_rooms = st.number_input("Total rooms", min_value=1, value=433, step=1)
+            min_rate = st.number_input("Minimum rate", min_value=0.0, value=150.0, step=5.0)
+            max_rate = st.number_input("Maximum rate", min_value=0.0, value=600.0, step=5.0)
+            adr_growth_pct = st.number_input("ADR growth target %", value=3.0, step=0.5)
+            occupancy_target_pct = st.number_input("Occupancy target %", min_value=0.0, max_value=100.0, value=85.0, step=1.0)
+
+        st.caption("Snapshot history")
+        if snap_summary["count"]:
+            start = pd.Timestamp(snap_summary["start"]).strftime("%b %d, %Y")
+            end = pd.Timestamp(snap_summary["end"]).strftime("%b %d, %Y")
+            st.write(f"{snap_summary['count']} snapshots stored ({start} to {end})")
+        else:
+            st.write("No snapshots stored yet")
+
+        st.caption("Decision log")
+        st.write(f"{dec_summary['count']} decisions logged")
+
+        with st.expander("Alert suppression", expanded=False):
+            labels = {
+                "low_demand_weekday_flight": "Suppress low-demand weekday flight signals",
+                "compset_min_demand": "Require Elevated+ demand for compset gaps",
+                "rate_change_threshold_20": "Use $20 threshold for rate-change info",
+                "dedupe_consecutive": "Collapse repeated consecutive alerts",
+                "sold_out_pricing": "Suppress pricing alerts on sold-out dates",
+            }
+            suppressions = {
+                key: st.checkbox(labels[key], value=DEFAULT_SUPPRESSIONS[key], key=f"suppress_{key}")
+                for key in DEFAULT_SUPPRESSIONS
+            }
+
+    return {
+        "total_rooms": int(total_rooms),
+        "occupancy_target": float(occupancy_target_pct) / 100,
+        "adr_growth_target": float(adr_growth_pct) / 100,
+        "min_rate": float(min_rate),
+        "max_rate": float(max_rate),
+        "suppressions": suppressions,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -222,6 +280,46 @@ def parse_uploads(today_file: Any, yesterday_file: Any | None) -> tuple[dict[str
     return today_data, yesterday_data
 
 
+@st.cache_data(show_spinner=False)
+def parse_dpu_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Parse a DPU workbook with Streamlit caching.
+
+    Args:
+        file_bytes: Uploaded workbook bytes.
+        filename: Uploaded filename used only as a cache key component.
+
+    Returns:
+        Parsed DPU DataFrame.
+    """
+    from io import BytesIO
+
+    _ = filename
+    return parse_dpu_report(BytesIO(file_bytes))
+
+
+def parse_dpu_upload(dpu_file: Any | None) -> pd.DataFrame | None:
+    """Parse an optional DPU upload.
+
+    Args:
+        dpu_file: Optional uploaded DPU workbook.
+
+    Returns:
+        Parsed DPU DataFrame or ``None``.
+    """
+    if dpu_file is None:
+        return None
+    with st.spinner("Parsing DPU report..."):
+        try:
+            parsed = parse_dpu_cached(dpu_file.getvalue(), dpu_file.name)
+        except Exception as exc:
+            st.warning(f"DPU report could not be parsed: {exc}")
+            return None
+    if parsed.empty:
+        st.warning("DPU report did not contain recognizable arrival-date rows.")
+        return None
+    return parsed
+
+
 def render_snapshot_summary(df_today: pd.DataFrame, comparison_active: bool) -> None:
     """Show snapshot date range and mode.
 
@@ -236,6 +334,68 @@ def render_snapshot_summary(df_today: pd.DataFrame, comparison_active: bool) -> 
     max_date = df_today["Date"].max().strftime("%b %d, %Y")
     mode = "Comparison mode" if comparison_active else "Single-file exploration"
     st.caption(f"{mode} | Snapshot window: {min_date} to {max_date} | {len(df_today):,} daily rows")
+
+
+def render_tabs(
+    today_data: dict[str, pd.DataFrame | None],
+    df_today: pd.DataFrame,
+    df_yesterday: pd.DataFrame | None,
+    df_future: pd.DataFrame,
+    current_day: pd.Timestamp,
+    dpu_df: pd.DataFrame | None,
+    config: dict[str, Any],
+) -> None:
+    """Render the full tab set in the required order.
+
+    Args:
+        today_data: Parsed current workbook dictionary.
+        df_today: Current daily detail dataframe.
+        df_yesterday: Optional prior daily detail dataframe.
+        df_future: Forward-period daily detail dataframe.
+        current_day: Today's date normalized to midnight.
+        dpu_df: Optional parsed DPU dataframe.
+        config: Property settings and alert suppression toggles.
+
+    Returns:
+        None.
+    """
+    tabs = st.tabs(
+        [
+            "🚨 Action Center",
+            "📈 Demand & Rate",
+            "⚖️ Overnight Changes",
+            "📊 Operational View",
+            "💡 Rate Recommendations",
+            "📈 Demand Trends",
+            "🌍 Market Intelligence",
+            "📝 Decision Log",
+            "📋 Full Data",
+        ]
+    )
+    with tabs[0]:
+        if df_yesterday is None:
+            st.info("Upload yesterday's Lighthouse export to unlock action alerts.")
+        else:
+            render_action_center(df_today, df_yesterday, current_day, dpu_df, config["suppressions"])
+    with tabs[1]:
+        render_demand_rate(df_today, df_future)
+    with tabs[2]:
+        if df_yesterday is None:
+            st.info("Upload yesterday's Lighthouse export to compare overnight changes.")
+        else:
+            render_overnight_changes(df_today, df_yesterday, current_day)
+    with tabs[3]:
+        render_operational_view(df_future, dpu_df)
+    with tabs[4]:
+        render_rate_recommendations(df_future, dpu_df, config)
+    with tabs[5]:
+        render_demand_trends()
+    with tabs[6]:
+        render_market_intelligence(today_data, df_future)
+    with tabs[7]:
+        render_decision_log(df_future)
+    with tabs[8]:
+        render_full_data(df_today, df_future)
 
 
 def render_empty_state() -> None:
@@ -368,18 +528,26 @@ def render_single_file_tabs(
         render_full_data(df_today, df_future)
 
 
-def render_action_center(df_today: pd.DataFrame, df_yesterday: pd.DataFrame, current_day: pd.Timestamp) -> None:
+def render_action_center(
+    df_today: pd.DataFrame,
+    df_yesterday: pd.DataFrame,
+    current_day: pd.Timestamp,
+    dpu_df: pd.DataFrame | None = None,
+    suppressions: dict[str, bool] | None = None,
+) -> None:
     """Render alert summary, filterable alerts, and future overnight table.
 
     Args:
         df_today: Current daily detail dataframe.
         df_yesterday: Prior daily detail dataframe.
         current_day: Today's date normalized to midnight.
+        dpu_df: Optional DPU dataframe.
+        suppressions: Optional alert suppression toggles.
 
     Returns:
         None.
     """
-    alerts = generate_alerts(df_today, df_yesterday)
+    alerts = generate_alerts(df_today, df_yesterday, dpu_df=dpu_df, suppressions=suppressions)
     counts = {severity: sum(1 for alert in alerts if alert["severity"] == severity) for severity in SEVERITY_COLORS}
     cols = st.columns(4)
     for col, severity in zip(cols, ["critical", "warning", "opportunity", "info"]):
@@ -598,6 +766,392 @@ def render_overnight_changes(df_today: pd.DataFrame, df_yesterday: pd.DataFrame,
                 "body": f"Rate moved from {money(row['Price_yest'])} to Sold out. Demand is {row['Demand_today']}.",
             }
         )
+
+
+def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None) -> None:
+    """Render combined Lighthouse and DPU operational context.
+
+    Args:
+        df_future: Forward-period daily detail dataframe.
+        dpu_df: Optional parsed DPU dataframe.
+
+    Returns:
+        None.
+    """
+    if dpu_df is None or dpu_df.empty:
+        st.info("Upload a DPU report to unlock this view.")
+        return
+
+    combined = build_operational_table(df_future, dpu_df)
+    urgent = combined[(combined["Demand level"] == "Very high") & (combined["Rooms Variance"] < 0)]
+    sold_cheap = combined[
+        combined["My price"].astype(str).str.lower().eq("sold out")
+        & combined["ADR on Books"].notna()
+        & combined["STLY ADR"].notna()
+        & (combined["ADR on Books"] < combined["STLY ADR"])
+    ]
+    soft_ahead = combined[(combined["Rooms Variance"] > 10) & (combined["Demand level"].isin(["Low", "Normal"]))]
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.markdown(
+            f'<div class="callout"><b>{len(urgent)}</b> high-demand date(s) are behind pace. '
+            f'{_date_list(urgent)}</div>',
+            unsafe_allow_html=True,
+        )
+    with cols[1]:
+        st.markdown(
+            f'<div class="callout"><b>{len(sold_cheap)}</b> sold-out date(s) show ADR below STLY. '
+            f'{_date_list(sold_cheap)}</div>',
+            unsafe_allow_html=True,
+        )
+    with cols[2]:
+        st.markdown(
+            f'<div class="callout"><b>{len(soft_ahead)}</b> soft-demand date(s) are ahead of pace. '
+            f'{_date_list(soft_ahead)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    display = combined.copy()
+    display["Date"] = display["Date"].dt.strftime("%a %b %d")
+    for column in ["ADR on Books", "STLY ADR", "ADR Variance", "My price"]:
+        if column in display.columns:
+            display[column] = display[column].map(money)
+    for column in ["Rooms on Books", "STLY Rooms", "Rooms Variance"]:
+        if column in display.columns:
+            display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{float(value):,.0f}")
+    st.dataframe(display, use_container_width=True, hide_index=True, height=460)
+
+
+def render_rate_recommendations(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None, config: dict[str, Any]) -> None:
+    """Render transient rate recommendations and exports.
+
+    Args:
+        df_future: Forward-period daily detail dataframe.
+        dpu_df: Optional parsed DPU dataframe.
+        config: Property-level settings.
+
+    Returns:
+        None.
+    """
+    if dpu_df is None or dpu_df.empty:
+        st.info("Upload a DPU report to unlock this view. Showing reduced recommendations from Lighthouse data only.")
+
+    rows: list[dict[str, Any]] = []
+    details: dict[str, list[str]] = {}
+    for _, row in df_future.sort_values("Date").iterrows():
+        dpu_row = _lookup_dpu(dpu_df, row["Date"])
+        recommendation = recommend_rate(row, dpu_row, config)
+        date_key = pd.Timestamp(row["Date"]).strftime("%Y-%m-%d")
+        rows.append(
+            {
+                "Date": pd.Timestamp(row["Date"]),
+                "Demand": row.get("Demand level"),
+                "Rooms OTB": None if dpu_row is None else dpu_row.get("Rooms on Books"),
+                "ADR OTB": None if dpu_row is None else dpu_row.get("ADR on Books"),
+                "STLY ADR": None if dpu_row is None else dpu_row.get("STLY ADR"),
+                "Recommended Rate": recommendation["recommended_rate"],
+                "Current Rate": recommendation["current_rate"],
+                "Delta ($)": recommendation["rate_delta"],
+            }
+        )
+        details[date_key] = recommendation["step_by_step"]
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        st.info("No future dates are available for recommendations.")
+        return
+
+    display = table.copy()
+    display["Date Label"] = display["Date"].dt.strftime("%a %b %d")
+    styled = display[
+        ["Date Label", "Demand", "Rooms OTB", "ADR OTB", "STLY ADR", "Recommended Rate", "Current Rate", "Delta ($)"]
+    ].style.map(_delta_color, subset=["Delta ($)"]).format(
+        {
+            "Rooms OTB": lambda value: "" if pd.isna(value) else f"{float(value):,.0f}",
+            "ADR OTB": money,
+            "STLY ADR": money,
+            "Recommended Rate": money,
+            "Current Rate": money,
+            "Delta ($)": lambda value: "" if pd.isna(value) else f"${float(value):+,.0f}",
+        }
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=420)
+
+    selected = st.selectbox(
+        "Recommendation walkthrough",
+        options=table["Date"].dt.strftime("%Y-%m-%d").tolist(),
+    )
+    with st.expander(f"Calculation for {selected}", expanded=True):
+        for step in details[selected]:
+            st.write(step)
+
+    export = table.copy()
+    export["Date"] = export["Date"].dt.strftime("%Y-%m-%d")
+    st.download_button(
+        "Download recommendations CSV",
+        data=export.to_csv(index=False),
+        file_name="rate_recommendations.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def render_demand_trends() -> None:
+    """Render persisted demand trend analysis.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+    """
+    st.warning("Snapshot history is stored locally in ./snapshots/. On Streamlit Cloud this resets on redeploy; export CSV to preserve it locally.")
+    trend = build_trend_dataframe()
+    if trend.empty:
+        st.info("No stored snapshots are available yet. Upload a Lighthouse snapshot to begin building trend history.")
+        return
+
+    arrival_dates = sorted(trend["arrival_date"].dt.date.unique())
+    selected_date = st.date_input("Arrival date to analyze", value=arrival_dates[0], min_value=min(arrival_dates), max_value=max(arrival_dates))
+    selected = trend[trend["arrival_date"].dt.date == selected_date].sort_values("snapshot_date")
+    if selected.empty:
+        st.info("No trend records exist for the selected arrival date.")
+    else:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Scatter(
+                x=selected["snapshot_date"],
+                y=selected["demand_level_num"],
+                text=selected["demand_level_str"],
+                mode="lines+markers",
+                name="Demand forecast",
+                hovertemplate="%{x|%b %d}<br>%{text}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=selected["snapshot_date"],
+                y=selected["my_price"],
+                mode="lines+markers",
+                name="My rate",
+                line=dict(color="#0f172a"),
+                hovertemplate="%{x|%b %d}<br>Rate: $%{y:,.0f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+        style_plot(fig, height=330)
+        fig.update_yaxes(tickvals=list(DEMAND_NUM.values()), ticktext=DEMAND_ORDER, secondary_y=False, title_text="Demand")
+        fig.update_yaxes(tickprefix="$", secondary_y=True, title_text="Rate")
+        st.plotly_chart(fig, use_container_width=True)
+
+        first = selected.iloc[0]
+        last = selected.iloc[-1]
+        st.markdown(
+            f'<div class="callout">Demand for <b>{selected_date}</b> has moved from '
+            f'<b>{html.escape(str(first["demand_level_str"]))}</b> to <b>{html.escape(str(last["demand_level_str"]))}</b> '
+            f'over <b>{len(selected)}</b> snapshots. Rate moved from <b>{money(first["my_price"])}</b> to '
+            f'<b>{money(last["my_price"])}</b>.</div>',
+            unsafe_allow_html=True,
+        )
+
+    heatmap = trend.copy()
+    heatmap["Snapshot"] = heatmap["snapshot_date"].dt.strftime("%m/%d")
+    heatmap["Arrival"] = heatmap["arrival_date"].dt.strftime("%m/%d")
+    values = heatmap.pivot_table(index="Snapshot", columns="Arrival", values="demand_level_num", aggfunc="last")
+    labels = heatmap.pivot_table(index="Snapshot", columns="Arrival", values="demand_level_str", aggfunc="last")
+    fig_heat = go.Figure(
+        go.Heatmap(
+            z=values.values,
+            x=values.columns,
+            y=values.index,
+            text=labels.values,
+            texttemplate="%{text}",
+            colorscale=[[0, "#94a3b8"], [0.2, "#60a5fa"], [0.45, "#fbbf24"], [0.7, "#f97316"], [1, "#ef4444"]],
+            showscale=False,
+        )
+    )
+    style_plot(fig_heat, height=360)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    export = trend.copy()
+    export["snapshot_date"] = export["snapshot_date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    export["arrival_date"] = export["arrival_date"].dt.strftime("%Y-%m-%d")
+    st.download_button(
+        "Download trend CSV",
+        data=export.to_csv(index=False),
+        file_name="demand_trends.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def render_decision_log(df_future: pd.DataFrame) -> None:
+    """Render decision entry and history management.
+
+    Args:
+        df_future: Forward-period daily detail dataframe.
+
+    Returns:
+        None.
+    """
+    st.warning("Decision history is stored locally in ./decisions/log.json. On Streamlit Cloud this resets on redeploy; export CSV to preserve it locally.")
+    st.markdown('<div class="section-label">Log a Decision</div>', unsafe_allow_html=True)
+    min_date = df_future["Date"].min().date()
+    max_date = df_future["Date"].max().date()
+    selected_date = st.date_input("Arrival date", value=min_date, min_value=min_date, max_value=max_date, key="decision_date")
+    selected_rows = df_future[df_future["Date"].dt.date == selected_date]
+    selected = selected_rows.iloc[0] if not selected_rows.empty else pd.Series(dtype=object)
+    current_rate = selected.get("My price", np.nan)
+    current_numeric = pd.to_numeric(current_rate, errors="coerce")
+    rate_before_default = 0.0 if str(current_rate).lower() == "sold out" or pd.isna(current_numeric) else float(current_numeric)
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.write(f"Demand at time: {selected.get('Demand level', 'N/A')}")
+        st.write(f"Compset level: {selected.get('Smart Compset price level', 'N/A')}")
+        action = st.selectbox(
+            "Action",
+            ["Raised rate", "Lowered rate", "Closed channel", "Added restriction", "Opened availability", "No action"],
+        )
+    with cols[1]:
+        rate_before = st.number_input("Rate before", value=rate_before_default, step=5.0)
+        rate_after = st.number_input("Rate after", value=rate_before_default, step=5.0)
+    notes = st.text_area("Notes")
+    if st.button("Save decision", type="primary"):
+        append_decision(
+            {
+                "arrival_date": selected_date.isoformat(),
+                "action_taken": action,
+                "rate_before": rate_before,
+                "rate_after": rate_after,
+                "demand_at_time": selected.get("Demand level", ""),
+                "compset_at_time": selected.get("Smart Compset price level", ""),
+                "notes": notes,
+                "outcome": "",
+            }
+        )
+        st.success("Decision saved.")
+
+    st.markdown('<div class="section-label">Decision History</div>', unsafe_allow_html=True)
+    history = decisions_dataframe()
+    if history.empty:
+        st.info("No decisions have been logged yet.")
+        return
+
+    history = history.copy()
+    history["Delta"] = pd.to_numeric(history["rate_after"], errors="coerce") - pd.to_numeric(history["rate_before"], errors="coerce")
+    history = history.sort_values("arrival_date", ascending=False).reset_index(drop=False).rename(columns={"index": "Log Index"})
+    display = history.rename(
+        columns={
+            "arrival_date": "Date",
+            "action_taken": "Action",
+            "rate_before": "Rate Before",
+            "rate_after": "Rate After",
+            "demand_at_time": "Demand at Time",
+            "compset_at_time": "Compset at Time",
+            "notes": "Notes",
+            "outcome": "Outcome",
+        }
+    )
+    st.dataframe(
+        display[["Date", "Action", "Rate Before", "Rate After", "Delta", "Demand at Time", "Compset at Time", "Notes", "Outcome"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    selected_index = st.selectbox("Update outcome for log entry", options=history["Log Index"].tolist())
+    current_outcome = str(history.loc[history["Log Index"] == selected_index, "outcome"].iloc[0])
+    outcome = st.text_input("Outcome", value=current_outcome)
+    if st.button("Save outcome"):
+        update_decision_outcome(int(selected_index), outcome)
+        st.success("Outcome updated.")
+
+    st.download_button(
+        "Download decision log CSV",
+        data=display.to_csv(index=False),
+        file_name="decision_log.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge Lighthouse daily detail rows with DPU rows.
+
+    Args:
+        df_future: Forward-period Lighthouse dataframe.
+        dpu_df: Parsed DPU dataframe indexed by arrival date.
+
+    Returns:
+        Combined operational dataframe.
+    """
+    left = df_future[
+        ["Date", "Day", "Demand level", "Smart Compset price level", "My price", "My price level"]
+    ].copy()
+    right = dpu_df.reset_index().copy()
+    if "Arrival Date" in right.columns:
+        right = right.rename(columns={"Arrival Date": "Date"})
+    elif "index" in right.columns:
+        right = right.rename(columns={"index": "Date"})
+    right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
+    combined = left.merge(right, on="Date", how="left")
+    if "Rooms Variance" not in combined.columns:
+        combined["Rooms Variance"] = combined["Rooms on Books"] - combined["STLY Rooms"]
+    if "ADR Variance" not in combined.columns:
+        combined["ADR Variance"] = combined["ADR on Books"] - combined["STLY ADR"]
+    combined["Pace Status"] = np.select(
+        [combined["Rooms Variance"] > 5, combined["Rooms Variance"] < -5],
+        ["Ahead", "Behind"],
+        default="On Pace",
+    )
+    return combined[
+        [
+            "Date",
+            "Day",
+            "Demand level",
+            "Smart Compset price level",
+            "My price",
+            "My price level",
+            "Rooms on Books",
+            "ADR on Books",
+            "STLY Rooms",
+            "STLY ADR",
+            "Rooms Variance",
+            "ADR Variance",
+            "Pace Status",
+        ]
+    ]
+
+
+def _lookup_dpu(dpu_df: pd.DataFrame | None, date_value: Any) -> pd.Series | None:
+    """Find one DPU row by normalized arrival date."""
+    if dpu_df is None or dpu_df.empty:
+        return None
+    key = pd.Timestamp(date_value).normalize()
+    if key not in dpu_df.index:
+        return None
+    row = dpu_df.loc[key]
+    return row.iloc[0] if isinstance(row, pd.DataFrame) else row
+
+
+def _date_list(df: pd.DataFrame) -> str:
+    """Return a compact list of dates for a callout."""
+    if df.empty:
+        return "No dates currently flagged."
+    dates = df["Date"].dt.strftime("%b %d").head(5).tolist()
+    suffix = "..." if len(df) > 5 else ""
+    return f"Dates: {', '.join(dates)}{suffix}"
+
+
+def _delta_color(value: Any) -> str:
+    """Return CSS color for recommendation deltas."""
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number) or number == 0:
+        return "color: #64748b"
+    if number > 0:
+        return "color: #16a34a; font-weight: 700"
+    return "color: #ef4444; font-weight: 700"
 
 
 def render_market_intelligence(today_data: dict[str, pd.DataFrame | None], df_future: pd.DataFrame) -> None:
