@@ -1101,8 +1101,8 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd
     if "ADR Variance" not in combined.columns:
         combined["ADR Variance"] = combined["ADR on Books"] - combined["STLY ADR"]
     combined["Pace Status"] = np.select(
-        [combined["Rooms Variance"] > 5, combined["Rooms Variance"] < -5],
-        ["Ahead", "Behind"],
+        [combined["Rooms Variance"].isna(), combined["Rooms Variance"] > 5, combined["Rooms Variance"] < -5],
+        ["N/A", "Ahead", "Behind"],
         default="On Pace",
     )
     return combined[
