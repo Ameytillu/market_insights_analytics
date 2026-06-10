@@ -88,7 +88,17 @@ def build_trend_dataframe(directory: Path = SNAPSHOT_DIR) -> pd.DataFrame:
                     "compset_level": record.get("Smart Compset price level"),
                 }
             )
-    return pd.DataFrame(rows).dropna(subset=["snapshot_date", "arrival_date"]).sort_values(
+    columns = [
+        "snapshot_date",
+        "arrival_date",
+        "demand_level_num",
+        "demand_level_str",
+        "my_price",
+        "compset_level",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).dropna(subset=["snapshot_date", "arrival_date"]).sort_values(
         ["snapshot_date", "arrival_date"]
     )
 
