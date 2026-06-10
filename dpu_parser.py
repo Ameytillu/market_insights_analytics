@@ -14,6 +14,9 @@ CANONICAL_COLUMNS = [
     "Rooms on Books",
     "ADR on Books",
     "Rooms Pickup",
+    "Pickup Start Rooms",
+    "Pickup Per Day",
+    "Pickup Snapshot Count",
     "STLY Rooms",
     "STLY ADR",
 ]
@@ -121,19 +124,31 @@ def _parse_standard_dpu_table(raw: pd.DataFrame, header_row: int, sheet_order: i
         rows.append(
             {
                 "Arrival Date": arrival_date,
-                "Rooms on Books": raw.iat[row_index, rooms_col] if rooms_col is not None else np.nan,
-                "ADR on Books": raw.iat[row_index, adr_col] if adr_col is not None else np.nan,
-                "Rooms Pickup": raw.iat[row_index, pickup_rooms_col] if pickup_rooms_col is not None else np.nan,
-                "STLY Rooms": np.nan,
-                "STLY ADR": np.nan,
-                "_sheet_order": sheet_order,
+            "Rooms on Books": raw.iat[row_index, rooms_col] if rooms_col is not None else np.nan,
+            "ADR on Books": raw.iat[row_index, adr_col] if adr_col is not None else np.nan,
+            "Rooms Pickup": raw.iat[row_index, pickup_rooms_col] if pickup_rooms_col is not None else np.nan,
+            "Pickup Start Rooms": np.nan,
+            "Pickup Per Day": np.nan,
+            "Pickup Snapshot Count": np.nan,
+            "STLY Rooms": np.nan,
+            "STLY ADR": np.nan,
+            "_sheet_order": sheet_order,
             }
         )
 
     if not rows:
         return None
     out = pd.DataFrame(rows)
-    for column in ["Rooms on Books", "ADR on Books", "Rooms Pickup", "STLY Rooms", "STLY ADR"]:
+    for column in [
+        "Rooms on Books",
+        "ADR on Books",
+        "Rooms Pickup",
+        "Pickup Start Rooms",
+        "Pickup Per Day",
+        "Pickup Snapshot Count",
+        "STLY Rooms",
+        "STLY ADR",
+    ]:
         out[column] = pd.to_numeric(out[column].map(_null_if_blank), errors="coerce")
     return out[CANONICAL_COLUMNS + ["_sheet_order"]]
 
@@ -243,15 +258,23 @@ def _aggregate_arrival_date(group: pd.DataFrame) -> pd.Series:
     """Aggregate sheet snapshots into one operational row for an arrival date."""
     rooms_history = group["Rooms on Books"].dropna()
     if len(rooms_history) >= 2:
-        rooms_pickup = rooms_history.iloc[-1] - rooms_history.iloc[0]
+        pickup_start_rooms = rooms_history.iloc[0]
+        rooms_pickup = rooms_history.iloc[-1] - pickup_start_rooms
     else:
+        pickup_start_rooms = np.nan
         rooms_pickup = _last_valid(group["Rooms Pickup"])
+    snapshot_count = int(group["_sheet_order"].nunique())
+    sheet_span = max(float(group["_sheet_order"].max() - group["_sheet_order"].min()), 1.0)
+    pickup_per_day = rooms_pickup / sheet_span if pd.notna(rooms_pickup) else np.nan
 
     return pd.Series(
         {
             "Rooms on Books": _last_valid(group["Rooms on Books"]),
             "ADR on Books": _last_valid(group["ADR on Books"]),
             "Rooms Pickup": rooms_pickup,
+            "Pickup Start Rooms": pickup_start_rooms,
+            "Pickup Per Day": pickup_per_day,
+            "Pickup Snapshot Count": snapshot_count,
             "STLY Rooms": _last_valid(group["STLY Rooms"]),
             "STLY ADR": _last_valid(group["STLY ADR"]),
         }

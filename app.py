@@ -385,7 +385,7 @@ def render_tabs(
         else:
             render_overnight_changes(df_today, df_yesterday, current_day)
     with tabs[3]:
-        render_operational_view(df_future, dpu_df)
+        render_operational_view(df_future, dpu_df, config)
     with tabs[4]:
         render_rate_recommendations(df_future, dpu_df, config)
     with tabs[5]:
@@ -768,12 +768,13 @@ def render_overnight_changes(df_today: pd.DataFrame, df_yesterday: pd.DataFrame,
         )
 
 
-def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None) -> None:
+def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None, config: dict[str, Any]) -> None:
     """Render combined Lighthouse and DPU operational context.
 
     Args:
         df_future: Forward-period daily detail dataframe.
         dpu_df: Optional parsed DPU dataframe.
+        config: Property settings used for pickup forecast limits.
 
     Returns:
         None.
@@ -782,13 +783,26 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
         st.info("Upload a DPU report to unlock this view.")
         return
 
-    combined = build_operational_table(df_future, dpu_df)
+    combined = build_operational_table(df_future, dpu_df, config)
     urgent = combined[(combined["Demand level"] == "Very high") & (combined["Rooms Pickup"] < 0)]
     sold_cheap = combined[
         combined["My price"].astype(str).str.lower().eq("sold out")
         & combined["ADR on Books"].notna()
     ]
     soft_ahead = combined[(combined["Rooms Pickup"] > 10) & (combined["Demand level"].isin(["Low", "Normal"]))]
+
+    matched = combined["Rooms on Books"].notna()
+    total_pickup = combined["Rooms Pickup"].dropna().sum()
+    avg_forecast = combined["Forecast Pickup"].dropna().mean()
+    cols = st.columns(4)
+    with cols[0]:
+        render_kpi("DPU Matches", f"{int(matched.sum())}/{len(combined)}", "#0f172a")
+    with cols[1]:
+        render_kpi("Total Pickup", f"{total_pickup:+,.0f}", "#0f766e" if total_pickup >= 0 else "#ef4444")
+    with cols[2]:
+        render_kpi("Avg Forecast Pickup", "" if pd.isna(avg_forecast) else f"{avg_forecast:+,.0f}", "#3b82f6")
+    with cols[3]:
+        render_kpi("Strong Pickup Dates", str(int((combined["Rooms Pickup"] > 10).sum())), "#7c3aed")
 
     cols = st.columns(3)
     with cols[0]:
@@ -815,10 +829,29 @@ def render_operational_view(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None
     for column in ["ADR on Books", "My price"]:
         if column in display.columns:
             display[column] = display[column].map(money)
-    for column in ["Rooms on Books", "Rooms Pickup"]:
+    for column in ["Rooms on Books", "Pickup Start Rooms", "Rooms Pickup", "Pickup Per Day", "Forecast Pickup", "Forecast Rooms OTB"]:
         if column in display.columns:
             display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{float(value):,.0f}")
     st.dataframe(display, use_container_width=True, hide_index=True, height=460)
+
+    st.markdown('<div class="section-label">Pickup Detail</div>', unsafe_allow_html=True)
+    detail = combined[combined["Rooms on Books"].notna()].copy()
+    if detail.empty:
+        st.info("No DPU rows matched the Lighthouse dates. Check whether the DPU month matches the Lighthouse arrival month.")
+    else:
+        options = detail["Date"].dt.strftime("%Y-%m-%d").tolist()
+        selected = st.selectbox("Arrival date pickup detail", options=options)
+        row = detail[detail["Date"].dt.strftime("%Y-%m-%d") == selected].iloc[0]
+        st.markdown(
+            f'<div class="callout">For <b>{row["Date"].strftime("%a %b %d")}</b>, rooms moved from '
+            f'<b>{_whole_number(row.get("Pickup Start Rooms"))}</b> to <b>{_whole_number(row.get("Rooms on Books"))}</b>, '
+            f'a net pickup of <b>{_signed_number(row.get("Rooms Pickup"))}</b> rooms across '
+            f'<b>{_whole_number(row.get("Pickup Snapshot Count"))}</b> DPU snapshots. Current velocity is '
+            f'<b>{_signed_number(row.get("Pickup Per Day"))}</b> rooms/day. Forecast additional pickup is '
+            f'<b>{_signed_number(row.get("Forecast Pickup"))}</b>, putting projected rooms OTB near '
+            f'<b>{_whole_number(row.get("Forecast Rooms OTB"))}</b>.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_rate_recommendations(df_future: pd.DataFrame, dpu_df: pd.DataFrame | None, config: dict[str, Any]) -> None:
@@ -1074,12 +1107,13 @@ def render_decision_log(df_future: pd.DataFrame) -> None:
     )
 
 
-def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd.DataFrame:
+def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
     """Merge Lighthouse daily detail rows with DPU rows.
 
     Args:
         df_future: Forward-period Lighthouse dataframe.
         dpu_df: Parsed DPU dataframe indexed by arrival date.
+        config: Optional property settings for forecast limits.
 
     Returns:
         Combined operational dataframe.
@@ -1087,19 +1121,42 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd
     left = df_future[
         ["Date", "Day", "Demand level", "Smart Compset price level", "My price", "My price level"]
     ].copy()
+    left["Date"] = pd.to_datetime(left["Date"]).dt.normalize()
+    left["MonthDay"] = left["Date"].dt.strftime("%m-%d")
     right = dpu_df.reset_index().copy()
     if "Arrival Date" in right.columns:
         right = right.rename(columns={"Arrival Date": "Date"})
     elif "index" in right.columns:
         right = right.rename(columns={"index": "Date"})
     right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
-    combined = left.merge(right, on="Date", how="left")
+    right["DPU Date"] = right["Date"]
+    right["MonthDay"] = right["Date"].dt.strftime("%m-%d")
+    dpu_columns = [column for column in right.columns if column not in {"Date", "MonthDay"}]
+    combined = left.merge(right[["Date", "MonthDay"] + dpu_columns], on=["Date", "MonthDay"], how="left")
+    combined["DPU Match"] = np.where(combined["Rooms on Books"].notna(), "Exact date", "No match")
+
+    missing = combined["Rooms on Books"].isna()
+    if missing.any():
+        fallback = right.sort_values("Date").drop_duplicates("MonthDay", keep="last").set_index("MonthDay")
+        for column in dpu_columns:
+            combined.loc[missing, column] = combined.loc[missing, "MonthDay"].map(fallback[column])
+        filled = missing & combined["Rooms on Books"].notna()
+        combined.loc[filled, "DPU Match"] = "Month/day"
+
     if "Rooms Pickup" not in combined.columns:
         combined["Rooms Pickup"] = np.nan
+    if "Pickup Start Rooms" not in combined.columns:
+        combined["Pickup Start Rooms"] = np.nan
+    if "Pickup Per Day" not in combined.columns:
+        combined["Pickup Per Day"] = np.nan
+    if "Pickup Snapshot Count" not in combined.columns:
+        combined["Pickup Snapshot Count"] = np.nan
     if "Rooms Variance" not in combined.columns:
         combined["Rooms Variance"] = combined["Rooms on Books"] - combined["STLY Rooms"]
     if "ADR Variance" not in combined.columns:
         combined["ADR Variance"] = combined["ADR on Books"] - combined["STLY ADR"]
+    combined["Forecast Pickup"] = combined.apply(lambda row: forecast_room_pickup(row, config or {}), axis=1)
+    combined["Forecast Rooms OTB"] = combined["Rooms on Books"] + combined["Forecast Pickup"]
     combined["Pace Status"] = np.select(
         [combined["Rooms Variance"].isna(), combined["Rooms Variance"] > 5, combined["Rooms Variance"] < -5],
         ["N/A", "Ahead", "Behind"],
@@ -1115,9 +1172,49 @@ def build_operational_table(df_future: pd.DataFrame, dpu_df: pd.DataFrame) -> pd
             "My price level",
             "Rooms on Books",
             "ADR on Books",
+            "Pickup Start Rooms",
             "Rooms Pickup",
+            "Pickup Per Day",
+            "Forecast Pickup",
+            "Forecast Rooms OTB",
+            "DPU Match",
         ]
     ]
+
+
+def forecast_room_pickup(row: pd.Series, config: dict[str, Any]) -> float:
+    """Forecast additional room pickup for one arrival date.
+
+    Args:
+        row: Combined Lighthouse/DPU operational row.
+        config: Property settings containing total room count.
+
+    Returns:
+        Forecast additional room pickup, capped by remaining physical room supply.
+    """
+    rooms_on_books = pd.to_numeric(row.get("Rooms on Books"), errors="coerce")
+    pickup_per_day = pd.to_numeric(row.get("Pickup Per Day"), errors="coerce")
+    if pd.isna(rooms_on_books) or pd.isna(pickup_per_day):
+        return float("nan")
+
+    forecast_date = row.get("DPU Date") if pd.notna(row.get("DPU Date")) else row.get("Date")
+    arrival_date = pd.Timestamp(forecast_date).normalize()
+    days_to_arrival = max((arrival_date - pd.Timestamp(datetime.today().date())).days, 0)
+    if days_to_arrival == 0:
+        return 0.0
+
+    demand_multiplier = {
+        "Low": 0.70,
+        "Normal": 0.90,
+        "Elevated": 1.05,
+        "High": 1.20,
+        "Very high": 1.35,
+        "Sold out": 0.0,
+    }.get(str(row.get("Demand level")), 1.0)
+    forecast = pickup_per_day * min(days_to_arrival, 21) * demand_multiplier
+    total_rooms = float(config.get("total_rooms", 433))
+    remaining_supply = max(total_rooms - rooms_on_books, 0)
+    return float(max(-rooms_on_books, min(remaining_supply, forecast)))
 
 
 def _lookup_dpu(dpu_df: pd.DataFrame | None, date_value: Any) -> pd.Series | None:
@@ -1126,7 +1223,11 @@ def _lookup_dpu(dpu_df: pd.DataFrame | None, date_value: Any) -> pd.Series | Non
         return None
     key = pd.Timestamp(date_value).normalize()
     if key not in dpu_df.index:
-        return None
+        month_day = key.strftime("%m-%d")
+        matches = dpu_df[dpu_df.index.strftime("%m-%d") == month_day]
+        if matches.empty:
+            return None
+        return matches.iloc[-1]
     row = dpu_df.loc[key]
     return row.iloc[0] if isinstance(row, pd.DataFrame) else row
 
@@ -1148,6 +1249,22 @@ def _delta_color(value: Any) -> str:
     if number > 0:
         return "color: #16a34a; font-weight: 700"
     return "color: #ef4444; font-weight: 700"
+
+
+def _whole_number(value: Any) -> str:
+    """Format a whole numeric value for operational callouts."""
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return "N/A"
+    return f"{float(number):,.0f}"
+
+
+def _signed_number(value: Any) -> str:
+    """Format a signed numeric value for operational callouts."""
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return "N/A"
+    return f"{float(number):+,.0f}"
 
 
 def render_market_intelligence(today_data: dict[str, pd.DataFrame | None], df_future: pd.DataFrame) -> None:
